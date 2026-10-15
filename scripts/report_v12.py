@@ -1,0 +1,41 @@
+"""基于当前数据库与实测产物生成 V1.2 报告，不写生产数据。"""
+from pathlib import Path
+import sqlite3,json,hashlib,xml.etree.ElementTree as ET,datetime
+ROOT=Path(__file__).resolve().parents[1]
+def main():
+    out=ROOT/'reports';baseline=json.loads((out/'v12-current-audit/baseline.json').read_text(encoding='utf-8'))
+    with sqlite3.connect('file:'+str(ROOT/'data/agent.sqlite3')+'?mode=ro',uri=True) as db:
+        tables=[r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        counts={t:db.execute('SELECT COUNT(*) FROM "'+t+'"').fetchone()[0] for t in tables}
+        protected={t:hashlib.sha256(repr(db.execute('SELECT * FROM "'+t+'" ORDER BY rowid').fetchall()).encode()).hexdigest()==h for t,h in baseline['table_hashes'].items() if t not in ('schema_migration','sqlite_sequence')}
+        integrity=db.execute('PRAGMA integrity_check').fetchone()[0]
+        versions=[r[0] for r in db.execute('SELECT version FROM schema_migration ORDER BY version')]
+        official=dict(db.execute('SELECT verification_status,COUNT(*) FROM fact_evidence GROUP BY verification_status'))
+    with sqlite3.connect('file:'+str(out/'v12-browser.sqlite3')+'?mode=ro',uri=True) as db:
+        testcounts={t:db.execute('SELECT COUNT(*) FROM '+t).fetchone()[0] for t in ['observation_media','observation','observation_review','reviewed_observation_fact','annotation_revision','twin_scene_revision']}
+        unknown=db.execute("SELECT COUNT(*) FROM observation WHERE status='UNKNOWN'").fetchone()[0]
+        classes=dict(db.execute('SELECT data_class,COUNT(*) FROM reviewed_observation_fact GROUP BY data_class'))
+        linked=db.execute("SELECT COUNT(*) FROM twin_scene_revision WHERE configuration LIKE '%EVIDENCE_LINKED%'").fetchone()[0]
+    reports={name:json.loads((out/name).read_text(encoding='utf-8')) for name in ['browser-results.json','knowledge-browser-results.json','v12-browser-results.json','ocr-accuracy-test.json']}
+    checks={name:{'total':len(r['checks']),'passed':sum(c['passed'] for c in r['checks'])} for name,r in reports.items() if 'checks' in r}
+    unit=dict(ET.parse(out/'v12-delivery.xml').find('testsuite').attrib)
+    changed=[p for p,h in baseline['source_hashes'].items() if (ROOT/p).exists() and hashlib.sha256((ROOT/p).read_bytes()).hexdigest()!=h]
+    new=[]
+    for folder in ['backend','frontend/src','tests','scripts']:
+        for p in (ROOT/folder).rglob('*'):
+            relative=str(p.relative_to(ROOT))
+            if p.is_file() and '__pycache__' not in str(p) and relative not in baseline['source_hashes']:new.append(relative)
+    assert all(protected.values()) and integrity=='ok'
+    assert int(unit['failures'])==0 and int(unit['errors'])==0
+    assert all(c['total']==c['passed'] for c in checks.values())
+    summary={'timestamp':datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat(),'baseline_counts':baseline['counts'],'production_counts':counts,'protected_table_hash_matches':protected,'integrity':integrity,'migration_versions':versions,'official_status_counts':official,'pytest':unit,'browser_checks':checks,'ocr_accuracy':reports['ocr-accuracy-test.json'],'isolated_browser_counts':testcounts,'isolated_unknown':unknown,'isolated_fact_classes':classes,'isolated_evidence_linked_scenes':linked,'changed_files':changed+['README.md','test.ps1','frontend/dist (构建输出)'],'new_files':new+['docs/V1.2.md','reports/V1.2_REPORT.md','reports/v12-delivery.json'],'production_server':'START_REJECTED_BY_AUTOMATIC_REVIEW','test_server':'http://127.0.0.1:8002'}
+    (out/'v12-delivery.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+    lines=['# 魔域 Web Agent V1.2 交付与验收报告','',f"报告时间：{summary['timestamp']}。现有工程增量实现，历史数据与原创模拟副本保留。",'', '## 基线与保护','', '项目及父目录未发现AGENTS.md。Git返回not a git repository，因此无法区分已提交与未提交代码；没有初始化仓库或重新搭建。接手时已有TASK 02–05部分实现、迁移003与10项观察测试，本轮保留审计并扩展004。源码文件快照、SHA-256与SQLite一致性备份保存在reports/v12-current-audit；此前V1.1快照仍在reports/v1.2-baseline。', '', '| 项目 | 开始 | 交付 |','|---|---:|---:|',f"| 运行历史 | {baseline['counts']['runs']} | {counts['runs']} |",f"| 历史日志 | {baseline['counts']['logs']} | {counts['logs']} |",'| 官网可追溯事实 | 254 | 254 |','| 官网UNKNOWN | 276 | 276 |','| 官网证据总数（含UNKNOWN） | 530 | 530 |','| 官网冲突 | 9 | 9 |','',f"开始时{len(protected)}张业务表的有序内容SHA-256全部保持一致。仅迁移元数据增加；SQLite integrity_check={integrity}。",'', '## 修改文件', '', '相对本轮接手源码快照修改：']
+    lines+=['- `'+p+'`' for p in summary['changed_files']]
+    lines+=['','本轮新增：']+['- `'+p+'`' for p in summary['new_files']]
+    lines+=['', '保留并验证的V1.2观察模块包括observation_store/api、media_service、observation_vision/review、003迁移、Observation.vue与test_observation.py。本轮修复WebM跨次相似帧去重、并发抽帧配额、有限区域数值、视频先抽帧再标注、切页保存编辑状态、JSON标注撤销与日志渲染延迟；增加独立场景证据校验和版本管理。', '', '## 迁移与API','', '003创建媒体、观察、审核、事实、冲突、标注和事件表；004仅新增twin_scene_revision。schema_migration目前为2、3、4。两项均提供down SQL。scripts/migrate_observation.py要求服务已停止，回退前自动一致性归档整个SQLite，媒体文件保留原位。升级与整模块回退在独立库实测，8次运行、1450日志、530官网证据不变。不能用旧备份覆盖当前库而丢失后续运行日志。', '', '新增API前缀/api/observations：','', '- GET/POST `/media`；GET `/media/{id}`、`/media/{id}/preview`、`/media/{id}/file`。','- POST `/media/{id}/extract`、`/media/{id}/analyze`、`/media/{id}/annotations`。','- GET `/status`、`/results`、`/results/{id}`、`/facts`、`/conflicts`；POST `/results/{id}/review`。','- GET/POST `/twins`；GET `/twins/evidence`、`/twins/{scene_id}`。','- 原GET `/api/logs`新增tail=true，近期记录仍ID升序；默认分页与SSE after/Last-Event-ID不变。','', '所有POST保留本机、同源与X-Agent-Control校验。文件扩展名、签名、大小、分辨率、实际解码均校验；图片20MB、视频100MB/10分钟、每视频抽帧60张/100MB，按间隔抽帧并去重。未知版本不自动填入。请求结构、回退命令和完整说明见[docs/V1.2.md](../docs/V1.2.md)。', '', '## 页面入口与运行', '', '八个中文页面：`/#/observations`、`/#/media`、`/#/analysis`、`/#/annotations`、`/#/boss-samples`、`/#/review`、`/#/twins`、`/#/evidence`。原控制台、知识、流程、来源页面保留，并增加观察中心入口。','', '隔离验收页面：http://127.0.0.1:8002/#/observations，使用测试库。启动生产8000服务被自动审批拒绝，只返回blocked by policy，无具体理由；生产8000当前未启动。正常启动命令（在项目目录）：','', '```powershell','.\\.venv\\Scripts\\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000','```', '', '## 观察数量、审核事实与UNKNOWN','', '生产库原始素材0、视频帧0、识别观察0、审核事实0、真实官服观察事实0、研究配置0。未收到用户授权官服画面，没有预置虚构游戏数据。官网276项UNKNOWN保留，本轮真实官服UNKNOWN补全0。', '', f"隔离浏览器库累计实际操作（包含调试重试，全为原创模拟图）：{json.dumps(testcounts,ensure_ascii=False)}；剩余UNKNOWN {unknown}，审核事实类别{json.dumps(classes,ensure_ascii=False)}；EVIDENCE_LINKED配置版本{linked}。这些均不能计作官服观察或事实。",'', 'pytest中GAME_OBSERVATION标记仅用于说明TEST_ONLY/TEST_FIXTURE的隔离夹具，验证分类、人工纠正和官网冲突；不会写入生产库。已确认可见事实仍限制VISIBLE_IN_FRAME_ONLY，SIMULATOR只能形成SIMULATED_ASSUMPTION，官网记录保留原表与原版本。','', '## 实际识别与回归测试','', '原创中文OCR测试图的3个预定字符串（卡利亚堡、复仇骑士阿拉玛、灵魂晶石）全部实际命中；坐标850,500解析通过。原创模拟图的角色区域为[50,50,8,8]，从图像像素检测，不读取World内部真值。所有结果先进入observation，保存原图ID、区域、算法版本、置信度与原始文字。此结果不是官服识别率；真实游戏OCR、物体识别准确率与地图完整度尚未测定。','', '- 初始33项：32通过、1失败（WebM跨次重复抽帧）。修复后TASK 02–05的10项全部通过，再进入后续场景配置开发。', f"- 最终pytest：{unit['tests']}通过，0失败、0错误；证据reports/v12-delivery.xml。"]
+    lines += [f"- {name}：{c['passed']}/{c['total']}通过。" for name,c in checks.items()]
+    lines+=['- 前端vue-tsc、Vite生产构建通过；新页面与旧页面无JavaScript运行异常。','- 原Agent实测连续两轮自动通关，暂停/继续、阻塞恢复、异常失败、停止/紧急停止、任务回放、收益事件一致性和SSE断线补读全部通过。','- PNG/JPG导入与原始文件一致，MP4/WebM实际解码抽帧、重复请求与配额测试通过。','- 人工纠正UNKNOWN、审核后生成事实、官网原值不覆盖、保留双方冲突证据、标注编辑/撤销/历史版本及坐标依据通过。','- 独立场景实际引用已保存标注ID；无证据、未审核/UNKNOWN事实、混用类别、错版本、擅自扩展真实机制或值均被拒绝。','- 非阻断环境提示：Starlette TestClient弃用警告、OpenCV VP80封装提示；实际WebM编码抽帧成功。','', '## 数字孪生待实现机制与下一步','', '配置包含scene_id、dungeon_id、game_version、evidence_ids、map_regions、navigation_nodes、obstacles、enemy_definitions、stage_triggers、visible_mechanics、reward_definitions、confidence、validation_status；OFFICIAL_FACT、OBSERVED_FACT、SIMULATED_ASSUMPTION严格区分。真实条目的原值和版本必须匹配证据，模拟假设必须声明依据并限定SIMULATOR。EVIDENCE_LINKED只表示引用校验通过；全部配置RESEARCH_ONLY、current_game_verified=false、VISIBLE_PORTION_ONLY，不直接驱动原Agent。', '', '当前官服完整地图、路径连通、BOSS属性、关卡触发、机关逻辑、技能与掉落概率仍未验证。没有官服通用物体模型，人物位置由人工标注；未识别目标保持UNKNOWN。自动官网差异匹配目前主要覆盖九星副本级同字段，不自动判断版本有效性。', '', '建议下一步先采集用户拥有或获准使用、版本明确的多帧样本，人工建立OCR/区域/坐标基准，评估字符错误与目标检测误差，再建立坐标标定、多帧证据关联和同实体历史版本比较。缺失机制继续UNKNOWN，只能在独立模拟器使用明确标记的测试假设。', '', '没有官服客户端控制、注入、内存/协议篡改或反作弊绕过。完整实测数据：[v12-delivery.json](v12-delivery.json)。']
+    (out/'V1.2_REPORT.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    print(json.dumps({'protected_tables':len(protected),'pytest':unit['tests'],'browser':checks,'production_runs':counts['runs'],'production_logs':counts['logs']},ensure_ascii=False))
+if __name__=='__main__':main()

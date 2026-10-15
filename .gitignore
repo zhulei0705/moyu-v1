@@ -1,0 +1,15 @@
+.venv/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+.pytest_cache/
+data/*.sqlite3*
+data/
+reports/*.png
+.runtime/
+.env
+.env.*
+!.env.example
+reports/**
+!reports/V1.3.4_P2_*.md
+!reports/V1.3.4_P3_*.md
